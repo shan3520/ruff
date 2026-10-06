@@ -824,6 +824,31 @@ def ab(a: str):
     }
 
     #[test]
+    fn signature_help_after_conditional_dictionary() {
+        let test = cursor_test(
+            r#"
+            class C:
+                def method(self, *, x: int = 0, y: str = "", end: bool = False) -> None: ...
+
+            def caller(flag: bool):
+                kwargs = {"x": 1} if flag else {"y": "two"}
+                C().method(**kwargs, end=True<CURSOR>)
+            "#,
+        );
+
+        assert_snapshot!(test.signature_help_render(), @r#"
+
+        ============== active signature =============
+        (*, x: int = 0, y: str = "", end: bool = False) -> None
+        ---------------------------------------------
+
+        -------------- active parameter -------------
+        end: bool = False
+        ---------------------------------------------
+        "#);
+    }
+
+    #[test]
     fn signature_help_overload_arity_disambiguated1() {
         let test = CursorTest::builder()
             .source(

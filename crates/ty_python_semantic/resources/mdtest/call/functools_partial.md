@@ -29,6 +29,64 @@ p = partial(f, b="hello")
 reveal_type(p)  # revealed: partial[(a: int, *, b: str = "hello") -> bool]
 ```
 
+### Conditional dictionary expansion limit
+
+Checking a partial's wrapped callable shares the argument expansion limit with its dictionary
+alternatives.
+
+```py
+from functools import partial
+from typing import Literal, overload
+
+@overload
+def choose(value: Literal[True], **kwargs: int) -> int: ...
+@overload
+def choose(value: Literal[False], **kwargs: int) -> str: ...
+def choose(value: bool, **kwargs: int) -> int | str:
+    return 1
+
+def within_limit(flag: bool, value: bool) -> None:
+    result = partial(
+        choose,
+        value,
+        **({"a": 1} if flag else {}),
+        **({"b": 1} if flag else {}),
+        **({"c": 1} if flag else {}),
+        **({"d": 1} if flag else {}),
+        **({"e": 1} if flag else {}),
+        **({"f": 1} if flag else {}),
+        **({"g": 1} if flag else {}),
+    )
+    reveal_type(result)  # revealed: partial[Overload[(**kwargs: int) -> int, (**kwargs: int) -> str]]
+
+def over_limit(flag: bool, other: bool, value: bool) -> None:
+    result = partial(
+        choose,
+        value,
+        **({"a": 1} if flag else {}),
+        **({"b": 1} if flag else {}),
+        **({"c": 1} if flag else {}),
+        **({"d": 1} if flag else {}),
+        **({"e": 1} if flag else {}),
+        **({"f": 1} if flag else {}),
+        **({"g": 1} if flag else {"h": 1} if other else {}),
+    )
+    reveal_type(result)  # revealed: Unknown
+```
+
+An intersection member that accepts the wrapped call can still determine the partial's type.
+
+```py
+from typing import Callable
+from ty_extensions import Intersection
+from ty_extensions._internal import TypeOf
+
+def intersection(fn: Intersection[TypeOf[choose], Callable[..., bytes]], value: bool, flag: bool) -> None:
+    empty = {} if flag else {}
+    result = partial(fn, value, **empty, **empty, **empty, **empty, **empty, **empty, **empty, **empty)
+    reveal_type(result())  # revealed: int | bytes | str
+```
+
 ### Leading parameter bound by keyword
 
 Binding a positional-or-keyword parameter by keyword makes it defaulted and keyword-only in the

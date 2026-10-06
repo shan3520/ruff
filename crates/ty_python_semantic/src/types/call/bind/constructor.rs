@@ -234,7 +234,13 @@ impl<'db> ConstructorBinding<'db> {
 
         // Now that we've fully checked our own callable, we can determine whether downstream
         // constructors should be checked or not.
+        let should_check_downstream = self.should_check_downstream(db, env);
         if mode.is_provisional() {
+            // Inactive downstreams still provide provisional inference context, but their
+            // speculative expansions must not consume the selected constructor's budget.
+            let isolated_arguments =
+                (!should_check_downstream).then(|| argument_types.with_isolated_expansion_budget());
+            let argument_types = isolated_arguments.as_deref().unwrap_or(argument_types);
             if let Some(downstream) = self.downstream_constructor_mut() {
                 let _ = downstream.check_types_impl(
                     db,
@@ -246,7 +252,7 @@ impl<'db> ConstructorBinding<'db> {
                     mode,
                 );
             }
-        } else if !self.should_check_downstream(db, env) {
+        } else if !should_check_downstream {
             // If not, we can discard the downstream constructor bindings entirely.
             self.downstream_constructor = None;
         }
@@ -259,7 +265,11 @@ impl<'db> ConstructorBinding<'db> {
     /// the overall callable, because in multiple-matching-overload cases where the overload
     /// resolution algorithm might just collapse to `Unknown`, we want to make a more informed
     /// decision based on whether all overloads return instance types, or not.
-    fn should_check_downstream(&self, db: &'db dyn Db, env: &ProgramEnvironment<'db>) -> bool {
+    pub(super) fn should_check_downstream(
+        &self,
+        db: &'db dyn Db,
+        env: &ProgramEnvironment<'db>,
+    ) -> bool {
         let constructor_kind = self.constructor_kind();
         if constructor_kind.is_init() || self.downstream_constructor().is_none() {
             return false;

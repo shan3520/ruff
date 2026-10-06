@@ -799,6 +799,126 @@ def local() -> None:
 
     wrong = {"x": 1, "y": 2}
     forward(target, **wrong)  # error: [invalid-argument-type]
+
+def conditional(flag: bool) -> None:
+    kwargs = {"x": 1, "y": "two"} if flag else {"x": 2, "y": "three"}
+    reveal_type(forward(target, **kwargs))  # revealed: str
+    missing = {"x": 1, "y": "two"} if flag else {"x": 2}
+    forward(target, **missing)  # error: [missing-argument]
+```
+
+### Conditional dictionary expansion limit
+
+Argument expansion inside a forwarded `ParamSpec` shares the outer call's expansion limit.
+
+```py
+from typing import Callable, Literal, overload
+
+@overload
+def choose(value: Literal[True], **kwargs: int) -> int: ...
+@overload
+def choose(value: Literal[False], **kwargs: int) -> str: ...
+def choose(value: bool, **kwargs: int) -> int | str:
+    return 1
+
+def forward[**P, R](callback: Callable[P, R], /, *args: P.args, **kwargs: P.kwargs) -> R:
+    return callback(*args, **kwargs)
+
+def within_limit(flag: bool, value: bool) -> None:
+    result = forward(
+        choose,
+        value,
+        **({"a": 1} if flag else {}),
+        **({"b": 1} if flag else {}),
+        **({"c": 1} if flag else {}),
+        **({"d": 1} if flag else {}),
+        **({"e": 1} if flag else {}),
+        **({"f": 1} if flag else {}),
+        **({"g": 1} if flag else {}),
+    )
+    reveal_type(result)  # revealed: int | str
+
+def over_limit(flag: bool, other: bool, value: bool) -> None:
+    result = forward(
+        choose,
+        value,
+        **({"a": 1} if flag else {}),
+        **({"b": 1} if flag else {}),
+        **({"c": 1} if flag else {}),
+        **({"d": 1} if flag else {}),
+        **({"e": 1} if flag else {}),
+        **({"f": 1} if flag else {}),
+        **({"g": 1} if flag else {"h": 1} if other else {}),
+    )
+    reveal_type(result)  # revealed: Unknown
+
+def no_remaining_budget(flag: bool, value: bool) -> None:
+    result = forward(
+        choose,
+        value,
+        **({"a": 1} if flag else {}),
+        **({"b": 1} if flag else {}),
+        **({"c": 1} if flag else {}),
+        **({"d": 1} if flag else {}),
+        **({"e": 1} if flag else {}),
+        **({"f": 1} if flag else {}),
+        **({"g": 1} if flag else {}),
+        **({"h": 1} if flag else {}),
+    )
+    reveal_type(result)  # revealed: Unknown
+```
+
+The limit still applies when a provisional arity match would accept the unexpanded tuple.
+
+```py
+@overload
+def arity(x: int, y: str, **kwargs: int) -> Literal[1]: ...
+@overload
+def arity(x: int, y: str, z: int = 0, **kwargs: int) -> Literal[2]: ...
+def arity(x: int, y: str, z: int = 0, **kwargs: int) -> int:
+    return 1
+
+def provisional_arity(values: tuple[int, str] | tuple[int, str, int], flag: bool) -> None:
+    result = forward(
+        arity,
+        *values,
+        **({"a": 1} if flag else {}),
+        **({"b": 1} if flag else {}),
+        **({"c": 1} if flag else {}),
+        **({"d": 1} if flag else {}),
+        **({"e": 1} if flag else {}),
+        **({"f": 1} if flag else {}),
+        **({"g": 1} if flag else {}),
+        **({"h": 1} if flag else {}),
+    )
+    reveal_type(result)  # revealed: Unknown
+```
+
+Another outer overload can still accept the call when forwarding reaches the limit.
+
+```py
+from typing import Protocol
+
+class Forward(Protocol):
+    @overload
+    def __call__[**P, R](self, callback: Callable[P, R], /, *args: P.args, **kwargs: P.kwargs) -> R: ...
+    @overload
+    def __call__(self, callback: object, /, *args: object, **kwargs: object) -> str: ...
+
+def fallback(forward: Forward, values: tuple[int, str] | tuple[int, str, int], flag: bool) -> None:
+    result = forward(
+        arity,
+        *values,
+        **({"a": 1} if flag else {}),
+        **({"b": 1} if flag else {}),
+        **({"c": 1} if flag else {}),
+        **({"d": 1} if flag else {}),
+        **({"e": 1} if flag else {}),
+        **({"f": 1} if flag else {}),
+        **({"g": 1} if flag else {}),
+        **({"h": 1} if flag else {}),
+    )
+    reveal_type(result)  # revealed: str
 ```
 
 ### Preserve an unpacked required suffix

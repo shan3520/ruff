@@ -1,8 +1,9 @@
 use crate::Db;
 use std::borrow::Cow;
-use std::cell::OnceCell;
+use std::cell::{Cell, OnceCell};
 use std::fmt::Display;
 use std::hash::BuildHasherDefault;
+use std::rc::Rc;
 
 use itertools::{Either, Itertools};
 use ruff_db::parsed::parsed_module;
@@ -11,10 +12,11 @@ use ruff_python_ast::name::Name;
 use rustc_hash::FxHashMap;
 use ty_python_core::definition::{BindingsOwner, DefinitionKind};
 use ty_python_core::scope::{ScopeId, ScopeKind};
-use ty_python_core::semantic_index;
+use ty_python_core::{Truthiness, semantic_index};
 
 use crate::FxIndexMap;
 use crate::ProgramEnvironment;
+use crate::reachability::analyze_condition;
 use crate::subscript::PyIndex;
 use crate::types::infer::infer_definition_types;
 use crate::types::tuple::{TupleLength, TupleSpec};
@@ -50,6 +52,34 @@ pub(crate) enum Argument<'a> {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CallArguments<'a, 'db> {
     items: Vec<CallArgument<'a, 'db>>,
+    expansion_budget: Option<ArgumentExpansionBudget>,
+}
+
+#[derive(Clone, Debug)]
+struct ArgumentExpansionBudget {
+    state: Rc<ArgumentExpansionState>,
+    source_indices: Rc<[Option<usize>]>,
+    /// The number of outer argument lists represented by this nested check.
+    multiplicity: usize,
+}
+
+#[derive(Debug)]
+struct ArgumentExpansionState {
+    limit: usize,
+    size: Cell<usize>,
+    exceeded_at: Cell<Option<usize>>,
+}
+
+impl ArgumentExpansionBudget {
+    fn remap(&self, indices: impl Iterator<Item = Option<usize>>) -> Self {
+        Self {
+            state: Rc::clone(&self.state),
+            source_indices: indices
+                .map(|index| index.and_then(|index| self.source_indices[index]))
+                .collect(),
+            multiplicity: self.multiplicity,
+        }
+    }
 }
 
 /// An argument to a call and its inferred types, when available.
@@ -123,9 +153,11 @@ impl<'a, 'db> CallArgument<'a, 'db> {
             Self::Variadic(
                 VariadicArgument::Type(types) | VariadicArgument::Sequence { types, .. },
             )
-            | Self::Keywords(KeywordArgument::Type(types) | KeywordArgument::Known { types, .. }) => {
-                types
-            }
+            | Self::Keywords(
+                KeywordArgument::Type(types)
+                | KeywordArgument::Known { types, .. }
+                | KeywordArgument::Alternatives { types, .. },
+            ) => types,
         }
     }
 
@@ -341,6 +373,10 @@ pub(crate) enum KeywordArgument<'db> {
         types: CallArgumentTypes<'db>,
         keywords: UnpackedKeywords<'db>,
     },
+    Alternatives {
+        types: CallArgumentTypes<'db>,
+        alternatives: Box<[UnpackedKeywords<'db>]>,
+    },
 }
 
 /// Known keyword values and possible undeclared keys.
@@ -351,6 +387,49 @@ pub(crate) struct UnpackedKeywords<'db> {
 }
 
 impl<'db> UnpackedKeywords<'db> {
+    fn from_expression(
+        db: &'db dyn Db,
+        scope: Option<ScopeId<'db>>,
+        expression: &ast::Expr,
+        expression_type: &mut impl FnMut(&ast::Expr) -> Option<Type<'db>>,
+    ) -> Option<Vec<Self>> {
+        match expression {
+            ast::Expr::Dict(dictionary) => {
+                Some(vec![Self::from_literal(dictionary, expression_type)?])
+            }
+            ast::Expr::If(ast::ExprIf {
+                test, body, orelse, ..
+            }) => {
+                let truthiness = scope
+                    .and_then(|scope| {
+                        semantic_index(db, scope.program_file(db)).try_expression(test.as_ref())
+                    })
+                    .map_or(Truthiness::Ambiguous, |test| analyze_condition(db, test));
+                match truthiness {
+                    Truthiness::AlwaysTrue => {
+                        return Self::from_expression(db, scope, body, expression_type);
+                    }
+                    Truthiness::AlwaysFalse => {
+                        return Self::from_expression(db, scope, orelse, expression_type);
+                    }
+                    Truthiness::Ambiguous => {}
+                }
+
+                let mut alternatives = Self::from_expression(db, scope, body, expression_type)?;
+                let remaining = MAX_TOTAL_EXPANSION + 1 - alternatives.len();
+                // Keep one extra alternative to signal expansion overflow. Still check later branches
+                // for unsupported expressions, which fall back to ordinary dictionary inference.
+                alternatives.extend(
+                    Self::from_expression(db, scope, orelse, expression_type)?
+                        .into_iter()
+                        .take(remaining),
+                );
+                Some(alternatives)
+            }
+            _ => None,
+        }
+    }
+
     fn from_literal(
         dictionary: &ast::ExprDict,
         mut expression_type: impl FnMut(&ast::Expr) -> Option<Type<'db>>,
@@ -380,7 +459,11 @@ impl<'db> UnpackedKeywords<'db> {
 
     /// Recover a fresh local dictionary when its recorded uses cannot expose or mutate it.
     /// Checking every use of the name also excludes aliases carried across loop iterations.
-    fn from_local(db: &'db dyn Db, scope: ScopeId<'db>, expression: &ast::Expr) -> Option<Self> {
+    fn from_local(
+        db: &'db dyn Db,
+        scope: ScopeId<'db>,
+        expression: &ast::Expr,
+    ) -> Option<Vec<Self>> {
         if scope.scope(db).kind() != ScopeKind::Function {
             return None;
         }
@@ -410,19 +493,22 @@ impl<'db> UnpackedKeywords<'db> {
             return None;
         }
         let module = parsed_module(db, file.python_file(db)).load(db);
-        let dictionary = assignment.value(&module).as_dict_expr()?;
         let inference = infer_definition_types(db, definition);
         if inference.discards_dict_key_assignments() {
             return None;
         }
-        Self::from_literal(dictionary, |value| inference.try_expression_type(value))
+        Self::from_expression(db, Some(scope), assignment.value(&module), &mut |value| {
+            inference.try_expression_type(value)
+        })
     }
 }
 
 impl<'db> KeywordArgument<'db> {
     fn source_types(&self) -> &CallArgumentTypes<'db> {
         match self {
-            Self::Type(types) | Self::Known { types, .. } => types,
+            Self::Type(types) | Self::Known { types, .. } | Self::Alternatives { types, .. } => {
+                types
+            }
         }
     }
 
@@ -439,7 +525,7 @@ impl<'db> KeywordArgument<'db> {
 
     pub(crate) fn explicit_keyword_names(&self) -> impl Iterator<Item = &Name> {
         let keys = match self {
-            Self::Type(_) => [].as_slice(),
+            Self::Type(_) | Self::Alternatives { .. } => [].as_slice(),
             Self::Known { keywords, .. } => keywords.keys.as_ref(),
         };
         keys.iter()
@@ -452,6 +538,8 @@ impl<'db> KeywordArgument<'db> {
                 .into_iter()
                 .map(|ty| Self::Type(CallArgumentTypes::new(Some(ty))))
                 .collect(),
+            // Complete dictionary alternatives are expanded before overload type expansion.
+            Self::Alternatives { .. } => return None,
             Self::Known { types, keywords } => {
                 expand_elements(db, env, keywords.keys.iter().map(|(_, key)| key.value_ty))?
                     .into_iter()
@@ -590,6 +678,7 @@ impl<'a, 'db> CallArguments<'a, 'db> {
     ) -> Self {
         let mut call_arguments = Self {
             items: Vec::with_capacity(arguments.len()),
+            expansion_budget: None,
         };
 
         for arg_or_keyword in arguments.iter_source_order() {
@@ -711,16 +800,25 @@ impl<'a, 'db> CallArguments<'a, 'db> {
                         arg: None, value, ..
                     }),
                 ) => {
-                    let keywords = match value {
-                        ast::Expr::Dict(dictionary) => {
-                            UnpackedKeywords::from_literal(dictionary, &mut expression_type)
-                        }
-                        _ => scope.and_then(|scope| UnpackedKeywords::from_local(db, scope, value)),
-                    };
-                    if let Some(keywords) = keywords {
-                        *argument = KeywordArgument::Known {
-                            types: argument.source_types().clone(),
-                            keywords,
+                    let alternatives =
+                        UnpackedKeywords::from_expression(db, scope, value, &mut expression_type)
+                            .or_else(|| {
+                                scope.and_then(|scope| {
+                                    UnpackedKeywords::from_local(db, scope, value)
+                                })
+                            });
+                    if let Some(alternatives) = alternatives {
+                        let types = argument.source_types().clone();
+                        *argument = if let [keywords] = alternatives.as_slice() {
+                            KeywordArgument::Known {
+                                types,
+                                keywords: keywords.clone(),
+                            }
+                        } else {
+                            KeywordArgument::Alternatives {
+                                types,
+                                alternatives: alternatives.into_boxed_slice(),
+                            }
                         };
                     }
                 }
@@ -801,7 +899,12 @@ impl<'a, 'db> CallArguments<'a, 'db> {
             let mut items = Vec::with_capacity(self.items.len() + 1);
             items.push(CallArgument::new(Argument::Synthetic, bound_self));
             items.extend(self.items.iter().cloned());
-            Cow::Owned(CallArguments { items })
+            Cow::Owned(CallArguments {
+                items,
+                expansion_budget: self.expansion_budget.as_ref().map(|budget| {
+                    budget.remap(std::iter::once(None).chain((0..self.len()).map(Some)))
+                }),
+            })
         } else {
             Cow::Borrowed(self)
         }
@@ -815,6 +918,10 @@ impl<'a, 'db> CallArguments<'a, 'db> {
     fn start_from(&self, index: usize) -> Self {
         Self {
             items: self.items[index..].to_vec(),
+            expansion_budget: self
+                .expansion_budget
+                .as_ref()
+                .map(|budget| budget.remap((index..self.len()).map(Some))),
         }
     }
 
@@ -839,23 +946,34 @@ impl<'a, 'db> CallArguments<'a, 'db> {
                 .iter()
                 .map(|index| {
                     let mut argument = self.items[*index].clone();
-                    if let CallArgument::Keywords(KeywordArgument::Known { keywords, .. }) =
-                        &mut argument
-                    {
-                        keywords.keys = keywords
-                            .keys
-                            .iter()
-                            .filter(|(name, _)| {
-                                parameters
-                                    .keyword_by_name(name.as_str())
-                                    .is_none_or(|(index, _)| index >= prefix_len)
-                            })
-                            .cloned()
-                            .collect();
+                    if let CallArgument::Keywords(keywords) = &mut argument {
+                        let alternatives = match keywords {
+                            KeywordArgument::Type(_) => [].as_mut_slice(),
+                            KeywordArgument::Known { keywords, .. } => {
+                                std::slice::from_mut(keywords)
+                            }
+                            KeywordArgument::Alternatives { alternatives, .. } => alternatives,
+                        };
+                        for keywords in alternatives {
+                            keywords.keys = keywords
+                                .keys
+                                .iter()
+                                .filter(|(name, _)| {
+                                    parameters
+                                        .keyword_by_name(name.as_str())
+                                        .is_none_or(|(index, _)| index >= prefix_len)
+                                })
+                                .cloned()
+                                .collect();
+                        }
                     }
                     argument
                 })
                 .collect(),
+            expansion_budget: self
+                .expansion_budget
+                .as_ref()
+                .map(|budget| budget.remap(indices.iter().copied().map(Some))),
         }
     }
 
@@ -904,6 +1022,125 @@ impl<'a, 'db> CallArguments<'a, 'db> {
             env,
             types: OnceCell::new(),
         }
+    }
+
+    pub(super) fn has_keyword_alternatives(&self) -> bool {
+        self.items.iter().any(|argument| {
+            matches!(
+                argument,
+                CallArgument::Keywords(KeywordArgument::Alternatives { .. })
+            )
+        })
+    }
+
+    pub(super) fn expansion_limit(&self) -> usize {
+        self.expansion_budget
+            .as_ref()
+            .map_or(MAX_TOTAL_EXPANSION, |budget| {
+                budget.state.limit / budget.multiplicity
+            })
+    }
+
+    pub(super) fn has_expansion_budget(&self) -> bool {
+        self.expansion_budget.is_some()
+    }
+
+    pub(super) fn with_expansion_budget_from(
+        mut self,
+        source: &Self,
+        indices: impl Iterator<Item = Option<usize>>,
+    ) -> Self {
+        self.expansion_budget = source
+            .expansion_budget
+            .as_ref()
+            .map(|budget| budget.remap(indices));
+        self
+    }
+
+    pub(super) fn with_isolated_expansion_budget(&self) -> Cow<'_, Self> {
+        let Some(budget) = &self.expansion_budget else {
+            return Cow::Borrowed(self);
+        };
+        Cow::Owned(Self {
+            items: self.items.clone(),
+            expansion_budget: Some(ArgumentExpansionBudget {
+                state: Rc::new(ArgumentExpansionState {
+                    limit: budget.state.limit,
+                    size: Cell::new(budget.multiplicity),
+                    exceeded_at: Cell::new(None),
+                }),
+                ..budget.clone()
+            }),
+        })
+    }
+
+    pub(super) fn set_expansion_budget(&mut self, limit: usize, multiplicity: usize) {
+        self.expansion_budget = Some(ArgumentExpansionBudget {
+            state: Rc::new(ArgumentExpansionState {
+                limit,
+                size: Cell::new(multiplicity),
+                exceeded_at: Cell::new(None),
+            }),
+            source_indices: (0..self.len()).map(Some).collect(),
+            multiplicity,
+        });
+    }
+
+    pub(super) fn record_expansion_size(&self, size: usize) {
+        if let Some(budget) = &self.expansion_budget {
+            budget
+                .state
+                .size
+                .set(budget.state.size.get().max(budget.multiplicity * size));
+        }
+    }
+
+    fn record_expansion_limit(&self, index: usize) {
+        if let Some(budget) = &self.expansion_budget {
+            budget
+                .state
+                .exceeded_at
+                .set(Some(budget.source_indices[index].unwrap_or(0)));
+        }
+    }
+
+    pub(super) fn expansion_outcome(&self) -> (usize, Option<usize>) {
+        self.expansion_budget.as_ref().map_or((1, None), |budget| {
+            (budget.state.size.get(), budget.state.exceeded_at.get())
+        })
+    }
+
+    /// Expand complete keyword sets before ordinary overload type expansion. Each replacement
+    /// retains its source argument index, even when the alternatives have different keys.
+    pub(super) fn expand_keyword_alternatives(&self) -> Option<Expansion<'a, 'db>> {
+        let mut expanded = None;
+        for (index, argument) in self.items.iter().enumerate() {
+            let CallArgument::Keywords(KeywordArgument::Alternatives {
+                types,
+                alternatives,
+            }) = argument
+            else {
+                continue;
+            };
+            let previous = expanded.get_or_insert_with(|| vec![self.clone()]);
+            if previous.len() * alternatives.len() > self.expansion_limit() {
+                return Some(Expansion::LimitReached(index));
+            }
+            *previous = previous
+                .iter()
+                .flat_map(|arguments| {
+                    alternatives.iter().map(|keywords| {
+                        let mut arguments = arguments.clone();
+                        arguments.items[index] = CallArgument::Keywords(KeywordArgument::Known {
+                            types: types.clone(),
+                            keywords: keywords.clone(),
+                        });
+                        arguments
+                    })
+                })
+                .collect();
+        }
+        expanded.map(Expansion::Expanded)
     }
 
     pub(super) fn display<'env>(
@@ -1062,10 +1299,12 @@ impl<'a, 'db> CallArgumentExpansions<'_, 'a, 'db> {
                 };
 
                 let expansion_size = expanded_types.len() * state.len();
-                if expansion_size > MAX_TOTAL_EXPANSION {
+                let limit = self.arguments.expansion_limit();
+                if expansion_size > limit {
+                    self.arguments.record_expansion_limit(index);
                     tracing::debug!(
                         "Skipping argument type expansion as it would exceed the \
-                            maximum number of expansions ({MAX_TOTAL_EXPANSION})"
+                            maximum number of expansions ({limit})"
                     );
                     return Some(State::LimitReached(index));
                 }
@@ -1076,6 +1315,12 @@ impl<'a, 'db> CallArgumentExpansions<'_, 'a, 'db> {
                     for alternative in expanded_types {
                         let mut expanded_argument = pre_expanded_types.clone();
                         expanded_argument.items[index] = alternative.clone();
+                        if let Some(budget) = &self.arguments.expansion_budget {
+                            expanded_argument.expansion_budget = Some(ArgumentExpansionBudget {
+                                multiplicity: budget.multiplicity * expansion_size,
+                                ..budget.clone()
+                            });
+                        }
                         expanded_arguments.push(expanded_argument);
                     }
                 }
@@ -1126,6 +1371,9 @@ impl<'a, 'db> FromIterator<(Argument<'a>, Option<Type<'db>>)> for CallArguments<
             items.push(CallArgument::new(argument, ty));
         }
 
-        Self { items }
+        Self {
+            items,
+            expansion_budget: None,
+        }
     }
 }

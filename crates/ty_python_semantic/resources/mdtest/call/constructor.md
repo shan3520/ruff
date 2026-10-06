@@ -1678,6 +1678,90 @@ class Box(Generic[T]):
 reveal_type(Box(1))  # revealed: Box[int]
 ```
 
+## Conditional keyword dictionaries
+
+`__new__` can return a different type for each branch, so ty checks `__init__` only when it returns
+an instance of the class.
+
+```py
+from typing import Literal, overload
+from typing_extensions import Self
+
+class Factory:
+    @overload
+    def __new__(cls, *, raw: Literal[True]) -> int: ...
+    @overload
+    def __new__(cls, *, value: str, extra: int = 0) -> Self: ...
+    def __new__(cls, **kwargs: object) -> object: ...
+    def __init__(self, *, value: str, extra: int) -> None: ...
+
+def downstream(flag: bool) -> None:
+    result = Factory(**({"raw": True} if flag else {"value": "x", "extra": 1}))
+    reveal_type(result)  # revealed: int | Factory
+    Factory(**({"raw": True} if flag else {"value": "x"}))  # error: [missing-argument]
+```
+
+An initializer that cannot run does not consume the call's expansion budget.
+
+```py
+class SkipsInit:
+    def __new__(cls, value: bool, **kwargs: int) -> int:
+        return 1
+
+    @overload
+    def __init__(self, value: Literal[True], **kwargs: int) -> None: ...
+    @overload
+    def __init__(self, value: Literal[False], **kwargs: int) -> None: ...
+    def __init__(self, value: bool, **kwargs: int) -> None: ...
+
+def skips_initializer(flag: bool, other: bool, value: bool) -> None:
+    result = SkipsInit(
+        value,
+        **({"a": 1} if flag else {}),
+        **({"b": 1} if flag else {}),
+        **({"c": 1} if flag else {}),
+        **({"d": 1} if flag else {}),
+        **({"e": 1} if flag else {}),
+        **({"f": 1} if flag else {}),
+        **({"g": 1} if flag else {"h": 1} if other else {}),
+    )
+    reveal_type(result)  # revealed: int
+```
+
+An inactive initializer's errors do not prevent its constructor from accepting a call, even when
+another intersection member reaches the expansion limit.
+
+```py
+from typing import Protocol
+from ty_extensions import Intersection
+
+class SkipsInvalidInit:
+    def __new__(cls, value: bool, **kwargs: int) -> int:
+        return 1
+
+    def __init__(self, value: str, required: str) -> None: ...
+
+class Heavy(Protocol):
+    @overload
+    def __call__(self, value: Literal[True], **kwargs: int) -> int: ...
+    @overload
+    def __call__(self, value: Literal[False], **kwargs: int) -> int: ...
+
+def intersection(call: Intersection[type[SkipsInvalidInit], Heavy], flag: bool, value: bool) -> None:
+    result = call(
+        value,
+        **({"a": 1} if flag else {}),
+        **({"b": 1} if flag else {}),
+        **({"c": 1} if flag else {}),
+        **({"d": 1} if flag else {}),
+        **({"e": 1} if flag else {}),
+        **({"f": 1} if flag else {}),
+        **({"g": 1} if flag else {}),
+        **({"h": 1} if flag else {}),
+    )
+    reveal_type(result)  # revealed: int
+```
+
 ## Generic constructor inference from overloaded `__init__` self types
 
 ```py

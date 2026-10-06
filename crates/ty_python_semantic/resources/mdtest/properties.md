@@ -734,6 +734,48 @@ static_assert(not is_subtype_of(TypeOf[attr_property.__get__], types.BuiltinMeth
 static_assert(not is_subtype_of(TypeOf[attr_property.__set__], types.BuiltinMethodType))
 ```
 
+## Conditional dictionary expansion limit
+
+Calls to a property's `__get__`, `__set__`, and `__delete__` methods share the argument expansion
+budget with the getter, setter, and deleter.
+
+```py
+from typing import Literal, overload
+
+@overload
+def get(value: Literal[True]) -> int: ...
+@overload
+def get(value: Literal[False]) -> str: ...
+def get(value: bool) -> int | str:
+    return 1
+
+@overload
+def set(value: Literal[True], new: object) -> None: ...
+@overload
+def set(value: Literal[False], new: object) -> None: ...
+def set(value: bool, new: object) -> None: ...
+@overload
+def delete(value: Literal[True]) -> None: ...
+@overload
+def delete(value: Literal[False]) -> None: ...
+def delete(value: bool) -> None: ...
+
+p = property(get, set, delete)
+
+def accessors(value: bool, flag: bool) -> None:
+    empty = {} if flag else {}
+    reveal_type(p.__get__(value, **empty, **empty, **empty, **empty, **empty, **empty, **empty))  # revealed: int | str
+    reveal_type(p.__get__(value, **empty, **empty, **empty, **empty, **empty, **empty, **empty, **empty))  # revealed: Unknown
+    unbound_get = property.__get__(p, value, **empty, **empty, **empty, **empty, **empty, **empty, **empty, **empty)
+    reveal_type(unbound_get)  # revealed: Unknown
+    reveal_type(p.__set__(value, 1, **empty, **empty, **empty, **empty, **empty, **empty, **empty, **empty))  # revealed: Unknown
+    unbound_set = property.__set__(p, value, 1, **empty, **empty, **empty, **empty, **empty, **empty, **empty, **empty)
+    reveal_type(unbound_set)  # revealed: Unknown
+    reveal_type(p.__delete__(value, **empty, **empty, **empty, **empty, **empty, **empty, **empty, **empty))  # revealed: Unknown
+    unbound_delete = property.__delete__(p, value, **empty, **empty, **empty, **empty, **empty, **empty, **empty, **empty)
+    reveal_type(unbound_delete)  # revealed: Unknown
+```
+
 ## Property type relations
 
 Property equivalence and disjointness are structural over the getter and setter types. We use
